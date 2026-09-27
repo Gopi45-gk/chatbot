@@ -8,7 +8,7 @@ interface CallLog {
   timestamp: Date;
 }
 
-type CallState = 'idle' | 'connecting' | 'active' | 'listening' | 'processing' | 'speaking';
+type CallState = 'idle' | 'connecting' | 'active' | 'listening' | 'processing' | 'speaking' | 'error';
 
 export default function CallBot() {
   const [callState, setCallState] = useState<CallState>('idle');
@@ -16,19 +16,42 @@ export default function CallBot() {
   const [callLogs, setCallLogs] = useState<CallLog[]>([]);
   const [isMuted, setIsMuted] = useState(false);
   const [isSpeakerOn, setIsSpeakerOn] = useState(true);
-  const [waveformBars, setWaveformBars] = useState<number[]>(Array(20).fill(20));
+  const [waveformBars, setWaveformBars] = useState<number[]>(Array(24).fill(15));
+  const [textInput, setTextInput] = useState('');
+  const [speechSupported, setSpeechSupported] = useState(true);
+  const [errorMessage, setErrorMessage] = useState('');
+
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
   const synthRef = useRef<SpeechSynthesis | null>(null);
+  const isListeningRef = useRef(false);
+  const callActiveRef = useRef(false);
+  const callStateRef = useRef<CallState>('idle');
+  
+  // Keep ref in sync with state
+  useEffect(() => {
+    callStateRef.current = callState;
+  }, [callState]);
 
   useEffect(() => {
     synthRef.current = window.speechSynthesis;
+    
+    // Check speech recognition support
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setSpeechSupported(false);
+    }
+    
     return () => {
+      callActiveRef.current = false;
       if (timerRef.current) clearInterval(timerRef.current);
-      if (synthRef.current) synthRef.current.cancel();
+      if (synthRef.current) {
+        synthRef.current.cancel();
+      }
       if (recognitionRef.current) {
-        try { recognitionRef.current.stop(); } catch(e) {}
+        isListeningRef.current = false;
+        try { recognitionRef.current.abort(); } catch(e) {}
       }
     };
   }, []);
@@ -39,24 +62,35 @@ export default function CallBot() {
 
   // Animate waveform
   useEffect(() => {
-    if (callState === 'active' || callState === 'listening' || callState === 'speaking') {
+    if (callState === 'listening' || callState === 'speaking') {
       const interval = setInterval(() => {
-        setWaveformBars(prev => prev.map(() => Math.random() * 80 + 20));
-      }, 150);
+        setWaveformBars(prev => prev.map(() => Math.random() * 85 + 15));
+      }, 120);
+      return () => clearInterval(interval);
+    } else if (callState === 'processing') {
+      const interval = setInterval(() => {
+        setWaveformBars(prev => prev.map((_, i) => {
+          const wave = Math.sin(Date.now() / 200 + i * 0.5) * 30 + 50;
+          return wave;
+        }));
+      }, 80);
       return () => clearInterval(interval);
     } else {
-      setWaveformBars(Array(20).fill(20));
+      setWaveformBars(Array(24).fill(15));
     }
   }, [callState]);
 
   // Call timer
   useEffect(() => {
-    if (callState === 'active' || callState === 'listening' || callState === 'speaking' || callState === 'processing') {
+    if (callState !== 'idle' && callState !== 'connecting' && callState !== 'error') {
       timerRef.current = setInterval(() => {
         setCallDuration(prev => prev + 1);
       }, 1000);
     } else {
-      if (timerRef.current) clearInterval(timerRef.current);
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
     }
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
@@ -69,220 +103,294 @@ export default function CallBot() {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const startCall = useCallback(() => {
-    setCallState('connecting');
-    setCallDuration(0);
-    setCallLogs([{
-      id: Date.now(),
-      text: "Connecting to MNN AI Bot...",
-      sender: 'bot',
+  const addLog = (text: string, sender: 'user' | 'bot') => {
+    setCallLogs(prev => [...prev, {
+      id: Date.now() + Math.random(),
+      text,
+      sender,
       timestamp: new Date(),
     }]);
+  };
 
-    setTimeout(() => {
-      setCallState('active');
-      setCallLogs(prev => [...prev, {
-        id: Date.now(),
-        text: "Hello! I'm your MNN AI assistant. I'm listening... speak to me!",
-        sender: 'bot',
-        timestamp: new Date(),
-      }]);
-      
-      // Try to speak the greeting
-      if (synthRef.current && isSpeakerOn) {
-        const utterance = new SpeechSynthesisUtterance("Hello! I'm your MNN AI assistant. I'm listening, speak to me!");
-        utterance.rate = 1.0;
-        utterance.pitch = 1.0;
-        synthRef.current.speak(utterance);
+  const speakText = useCallback((text: string, onEnd?: () => void) => {
+    if (!synthRef.current || !isSpeakerOn) {
+      onEnd?.();
+      return;
+    }
+    
+    synthRef.current.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+    utterance.volume = 1.0;
+    
+    // Try to find a good voice
+    const voices = synthRef.current.getVoices();
+    const preferredVoice = voices.find(v => v.lang.startsWith('en') && v.name.includes('Google')) 
+      || voices.find(v => v.lang.startsWith('en'))
+      || voices[0];
+    if (preferredVoice) utterance.voice = preferredVoice;
+    
+    utterance.onend = () => {
+      if (callActiveRef.current) {
+        onEnd?.();
       }
-      
-      startListening();
-    }, 2000);
+    };
+    utterance.onerror = () => {
+      if (callActiveRef.current) {
+        onEnd?.();
+      }
+    };
+    
+    synthRef.current.speak(utterance);
   }, [isSpeakerOn]);
 
   const startListening = useCallback(() => {
+    if (!callActiveRef.current || isMuted) return;
+    
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     
     if (!SpeechRecognition) {
-      setCallLogs(prev => [...prev, {
-        id: Date.now(),
-        text: "Speech recognition not supported. Type your message below instead.",
-        sender: 'bot',
-        timestamp: new Date(),
-      }]);
       setCallState('active');
       return;
+    }
+
+    // Stop any existing recognition
+    if (recognitionRef.current) {
+      isListeningRef.current = false;
+      try { recognitionRef.current.abort(); } catch(e) {}
     }
 
     const recognition = new SpeechRecognition();
     recognition.continuous = false;
     recognition.interimResults = false;
     recognition.lang = 'en-US';
+    recognition.maxAlternatives = 1;
 
     recognition.onresult = (event: any) => {
       const transcript = event.results[0][0].transcript;
+      
+      if (!transcript.trim()) {
+        // Empty result, restart listening
+        if (callActiveRef.current) {
+          setTimeout(() => startListening(), 300);
+        }
+        return;
+      }
+
+      addLog(transcript, 'user');
       setCallState('processing');
-      setCallLogs(prev => [...prev, {
-        id: Date.now(),
-        text: transcript,
-        sender: 'user',
-        timestamp: new Date(),
-      }]);
 
       // Process response
       setTimeout(() => {
         const response = getVoiceResponse(transcript);
+        addLog(response, 'bot');
         setCallState('speaking');
-        setCallLogs(prev => [...prev, {
-          id: Date.now() + 1,
-          text: response,
-          sender: 'bot',
-          timestamp: new Date(),
-        }]);
 
-        if (synthRef.current && isSpeakerOn) {
-          const utterance = new SpeechSynthesisUtterance(response);
-          utterance.rate = 1.0;
-          utterance.pitch = 1.0;
-          utterance.onend = () => {
+        speakText(response, () => {
+          if (callActiveRef.current && !isMuted) {
             setCallState('listening');
-            startListening();
-          };
-          synthRef.current.speak(utterance);
-        } else {
-          setTimeout(() => {
-            setCallState('listening');
-            startListening();
-          }, 1000);
-        }
-      }, 800);
+            setTimeout(() => startListening(), 200);
+          }
+        });
+      }, 500);
     };
 
-    recognition.onerror = () => {
-      setCallState('active');
-      // Retry listening
-      setTimeout(() => startListening(), 500);
+    recognition.onerror = (event: any) => {
+      if (!callActiveRef.current) return;
+      
+      // Don't treat 'no-speech' or 'aborted' as errors
+      if (event.error === 'no-speech' || event.error === 'aborted') {
+        if (callActiveRef.current && !isMuted) {
+          setTimeout(() => startListening(), 500);
+        }
+        return;
+      }
+      
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        setErrorMessage('Microphone access denied. Please allow microphone permission.');
+        setCallState('error');
+        return;
+      }
+
+      // For other errors, retry
+      if (callActiveRef.current) {
+        setTimeout(() => startListening(), 1000);
+      }
     };
 
     recognition.onend = () => {
-      if (callState !== 'idle') {
-        // Will be restarted by onresult or onend handler
+      isListeningRef.current = false;
+      // Auto-restart if call is still active and we're in listening state
+      if (callActiveRef.current && !isMuted && callStateRef.current !== 'processing' && callStateRef.current !== 'speaking') {
+        setTimeout(() => startListening(), 300);
       }
     };
 
     recognitionRef.current = recognition;
+    isListeningRef.current = true;
     setCallState('listening');
+    
     try {
       recognition.start();
     } catch(e) {
-      setCallState('active');
+      // If start fails, retry
+      setTimeout(() => {
+        if (callActiveRef.current) startListening();
+      }, 500);
     }
-  }, [isSpeakerOn, callState]);
+  }, [isMuted, speakText]);
 
-  const endCall = () => {
-    if (synthRef.current) synthRef.current.cancel();
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch(e) {}
-    }
-    setCallState('idle');
-    setCallLogs(prev => [...prev, {
-      id: Date.now(),
-      text: `Call ended. Duration: ${formatDuration(callDuration)}`,
-      sender: 'bot',
-      timestamp: new Date(),
-    }]);
+  const startCall = () => {
+    setCallState('connecting');
+    setCallDuration(0);
+    setCallLogs([]);
+    setErrorMessage('');
+    callActiveRef.current = true;
+
+    addLog("Connecting to MNN AI Bot...", 'bot');
+
+    setTimeout(() => {
+      const greeting = "Hello! I'm your MNN AI assistant. I'm listening. What would you like to talk about?";
+      addLog(greeting, 'bot');
+      setCallState('speaking');
+
+      speakText(greeting, () => {
+        if (callActiveRef.current) {
+          setCallState('listening');
+          startListening();
+        }
+      });
+    }, 1500);
   };
 
-  const handleTextInput = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter' && (e.target as HTMLInputElement).value.trim()) {
-      const text = (e.target as HTMLInputElement).value.trim();
-      (e.target as HTMLInputElement).value = '';
-      
-      setCallLogs(prev => [...prev, {
-        id: Date.now(),
-        text: text,
-        sender: 'user',
-        timestamp: new Date(),
-      }]);
+  const endCall = () => {
+    callActiveRef.current = false;
+    isListeningRef.current = false;
+    
+    if (synthRef.current) synthRef.current.cancel();
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch(e) {}
+      recognitionRef.current = null;
+    }
+    
+    addLog(`Call ended. Duration: ${formatDuration(callDuration)}`, 'bot');
+    setCallState('idle');
+  };
 
+  const handleTextSubmit = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && textInput.trim() && callState !== 'idle' && callState !== 'connecting') {
+      e.preventDefault();
+      const text = textInput.trim();
+      setTextInput('');
+      
+      addLog(text, 'user');
       setCallState('processing');
+
       setTimeout(() => {
         const response = getVoiceResponse(text);
+        addLog(response, 'bot');
         setCallState('speaking');
-        setCallLogs(prev => [...prev, {
-          id: Date.now() + 1,
-          text: response,
-          sender: 'bot',
-          timestamp: new Date(),
-        }]);
 
-        if (synthRef.current && isSpeakerOn) {
-          const utterance = new SpeechSynthesisUtterance(response);
-          utterance.onend = () => {
-            setCallState('listening');
-            startListening();
-          };
-          synthRef.current.speak(utterance);
-        } else {
-          setCallState('active');
-        }
-      }, 800);
+        speakText(response, () => {
+          if (callActiveRef.current) {
+            if (!isMuted && speechSupported) {
+              setCallState('listening');
+              startListening();
+            } else {
+              setCallState('active');
+            }
+          }
+        });
+      }, 500);
+    }
+  };
+
+  const toggleMute = () => {
+    const newMuted = !isMuted;
+    setIsMuted(newMuted);
+    
+    if (newMuted && recognitionRef.current) {
+      isListeningRef.current = false;
+      try { recognitionRef.current.abort(); } catch(e) {}
+      setCallState('active');
+    } else if (!newMuted && callActiveRef.current) {
+      setCallState('listening');
+      startListening();
+    }
+  };
+
+  const getStatusText = () => {
+    switch (callState) {
+      case 'idle': return 'Tap to start a voice call';
+      case 'connecting': return 'Establishing connection...';
+      case 'active': return isMuted ? '🔇 Microphone muted' : '📞 Call active — type below';
+      case 'listening': return '🎤 Listening... speak now';
+      case 'processing': return '🧠 Processing with MNN...';
+      case 'speaking': return '🔊 Speaking...';
+      case 'error': return '⚠️ Error occurred';
+      default: return '';
+    }
+  };
+
+  const getStatusColor = () => {
+    switch (callState) {
+      case 'idle': return 'bg-gray-600';
+      case 'connecting': return 'bg-yellow-500 animate-pulse';
+      case 'active': return 'bg-blue-500';
+      case 'listening': return 'bg-green-500';
+      case 'processing': return 'bg-purple-500 animate-pulse';
+      case 'speaking': return 'bg-blue-500 animate-pulse';
+      case 'error': return 'bg-red-500';
+      default: return 'bg-gray-600';
     }
   };
 
   return (
-    <div className="flex flex-col h-full bg-gradient-to-b from-gray-900 via-gray-800 to-gray-900">
+    <div className="flex flex-col h-full bg-gradient-to-b from-gray-900 via-slate-900 to-gray-900">
       {/* Call Header */}
-      <div className="px-4 py-3 text-center">
-        <p className="text-gray-400 text-xs uppercase tracking-wider">
-          {callState === 'idle' ? 'Voice Call' : callState === 'connecting' ? 'Connecting...' : 'MNN Voice Call'}
+      <div className="px-4 py-3 text-center flex-shrink-0">
+        <p className="text-gray-400 text-xs uppercase tracking-widest font-medium">
+          {callState === 'idle' ? 'Voice Call' : 'MNN Voice Call'}
         </p>
       </div>
 
       {/* Main Call Area */}
-      <div className="flex-1 flex flex-col items-center justify-center px-6">
+      <div className="flex-1 flex flex-col items-center justify-center px-6 overflow-hidden">
         {/* Avatar */}
-        <div className="relative mb-6">
-          <div className={`w-28 h-28 rounded-full flex items-center justify-center ${
-            callState === 'idle' ? 'bg-gray-700' :
-            callState === 'connecting' ? 'bg-yellow-600 animate-pulse' :
-            callState === 'listening' ? 'bg-green-600' :
-            callState === 'speaking' ? 'bg-blue-600' :
-            'bg-indigo-600'
-          } transition-colors duration-500`}>
-            <span className="text-5xl">🤖</span>
+        <div className="relative mb-5">
+          <div className={`w-24 h-24 rounded-full flex items-center justify-center ${getStatusColor()} transition-colors duration-500 shadow-xl`}>
+            <span className="text-4xl">🤖</span>
           </div>
-          {callState !== 'idle' && (
-            <div className="absolute inset-0 rounded-full border-4 border-white/20 animate-ping"></div>
+          {(callState === 'listening' || callState === 'speaking') && (
+            <>
+              <div className="absolute inset-[-8px] rounded-full border-2 border-white/20 animate-ping"></div>
+              <div className="absolute inset-[-16px] rounded-full border border-white/10 animate-ping" style={{ animationDelay: '0.5s' }}></div>
+            </>
           )}
         </div>
 
-        {/* Bot Name */}
-        <h2 className="text-white text-xl font-bold mb-1">MNN AI Bot</h2>
-        <p className="text-gray-400 text-sm mb-4">
-          {callState === 'idle' ? 'Tap to start a voice call' :
-           callState === 'connecting' ? 'Establishing connection...' :
-           callState === 'listening' ? '🎤 Listening...' :
-           callState === 'processing' ? '🧠 Thinking...' :
-           callState === 'speaking' ? '🔊 Speaking...' :
-           '📞 Call Active'}
-        </p>
+        {/* Bot Name & Status */}
+        <h2 className="text-white text-lg font-bold mb-1">MNN AI Bot</h2>
+        <p className="text-gray-400 text-sm mb-3">{getStatusText()}</p>
 
         {/* Duration */}
-        {callState !== 'idle' && (
-          <div className="bg-white/10 rounded-full px-4 py-1 mb-6">
+        {callState !== 'idle' && callState !== 'connecting' && (
+          <div className="bg-white/10 rounded-full px-4 py-1 mb-4 backdrop-blur-sm">
             <span className="text-white text-sm font-mono">{formatDuration(callDuration)}</span>
           </div>
         )}
 
         {/* Waveform */}
-        {(callState === 'listening' || callState === 'speaking') && (
-          <div className="flex items-center justify-center gap-0.5 h-16 mb-6">
+        {(callState === 'listening' || callState === 'speaking' || callState === 'processing') && (
+          <div className="flex items-center justify-center gap-[3px] h-14 mb-4 w-full max-w-xs">
             {waveformBars.map((height, i) => (
               <div
                 key={i}
-                className={`w-1 rounded-full transition-all duration-150 ${
-                  callState === 'listening' ? 'bg-green-400' : 'bg-blue-400'
+                className={`w-[3px] rounded-full transition-all duration-100 ${
+                  callState === 'listening' ? 'bg-green-400' : 
+                  callState === 'speaking' ? 'bg-blue-400' : 
+                  'bg-purple-400'
                 }`}
                 style={{ height: `${height}%` }}
               />
@@ -290,21 +398,28 @@ export default function CallBot() {
           </div>
         )}
 
+        {/* Error Message */}
+        {callState === 'error' && errorMessage && (
+          <div className="bg-red-500/20 border border-red-500/30 rounded-lg px-4 py-2 mb-4 max-w-xs">
+            <p className="text-red-300 text-xs text-center">{errorMessage}</p>
+          </div>
+        )}
+
         {/* Call Log */}
-        <div className="w-full max-w-sm max-h-48 overflow-y-auto mb-4 space-y-2">
-          {callLogs.slice(-6).map((log) => (
+        <div className="w-full max-w-sm flex-1 min-h-0 overflow-y-auto mb-3 space-y-1.5 px-1">
+          {callLogs.slice(-8).map((log) => (
             <div
               key={log.id}
-              className={`rounded-lg px-3 py-2 text-xs ${
+              className={`rounded-xl px-3 py-2 text-xs animate-slide-up ${
                 log.sender === 'user'
-                  ? 'bg-blue-600/30 text-blue-200 ml-8'
-                  : 'bg-white/10 text-gray-300 mr-8'
+                  ? 'bg-blue-600/20 text-blue-200 ml-6 border border-blue-500/20'
+                  : 'bg-white/5 text-gray-300 mr-6 border border-white/10'
               }`}
             >
-              <span className="font-medium">
-                {log.sender === 'user' ? '🎤 You' : '🤖 Bot'}:
-              </span>{' '}
-              {log.text}
+              <span className="font-semibold text-[10px] uppercase tracking-wider opacity-70">
+                {log.sender === 'user' ? '🎤 You' : '🤖 Bot'}
+              </span>
+              <p className="mt-0.5 leading-relaxed">{log.text}</p>
             </div>
           ))}
           <div ref={logEndRef} />
@@ -312,9 +427,9 @@ export default function CallBot() {
       </div>
 
       {/* Call Controls */}
-      <div className="px-6 pb-8 pt-4">
+      <div className="px-6 pb-6 pt-3 flex-shrink-0">
         {callState === 'idle' ? (
-          <div className="flex flex-col items-center gap-4">
+          <div className="flex flex-col items-center gap-3">
             <button
               onClick={startCall}
               className="w-16 h-16 bg-green-500 rounded-full flex items-center justify-center hover:bg-green-600 transition-all shadow-lg shadow-green-500/30 active:scale-95"
@@ -324,17 +439,35 @@ export default function CallBot() {
               </svg>
             </button>
             <p className="text-gray-400 text-sm">Tap to call MNN AI Bot</p>
-            <p className="text-gray-500 text-xs">Uses device microphone & speaker</p>
+            {!speechSupported && (
+              <p className="text-yellow-400/70 text-xs text-center max-w-xs">
+                ⚠️ Speech recognition not supported in this browser. You can still type during calls.
+              </p>
+            )}
           </div>
         ) : (
-          <div className="flex flex-col items-center gap-4">
+          <div className="flex flex-col items-center gap-3">
+            {/* Text input */}
+            <div className="w-full max-w-sm">
+              <input
+                type="text"
+                value={textInput}
+                onChange={(e) => setTextInput(e.target.value)}
+                onKeyDown={handleTextSubmit}
+                placeholder={isMuted || !speechSupported ? "Type your message & press Enter..." : "Or type here and press Enter..."}
+                className="w-full bg-white/10 text-white rounded-full px-4 py-2.5 text-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 border border-white/10"
+                disabled={callState === 'connecting'}
+              />
+            </div>
+
             {/* Control buttons */}
-            <div className="flex items-center gap-6 mb-4">
+            <div className="flex items-center gap-5">
               <button
-                onClick={() => setIsMuted(!isMuted)}
+                onClick={toggleMute}
                 className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${
-                  isMuted ? 'bg-red-500/30 text-red-400' : 'bg-white/10 text-white'
+                  isMuted ? 'bg-red-500 text-white' : 'bg-white/10 text-white hover:bg-white/20'
                 }`}
+                title={isMuted ? 'Unmute' : 'Mute'}
               >
                 {isMuted ? (
                   <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -348,11 +481,22 @@ export default function CallBot() {
                 )}
               </button>
 
+              {/* End call */}
+              <button
+                onClick={endCall}
+                className="w-14 h-14 bg-red-500 rounded-full flex items-center justify-center hover:bg-red-600 transition-all shadow-lg shadow-red-500/30 active:scale-95"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="w-6 h-6 text-white rotate-[135deg]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z" />
+                </svg>
+              </button>
+
               <button
                 onClick={() => setIsSpeakerOn(!isSpeakerOn)}
                 className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${
-                  !isSpeakerOn ? 'bg-red-500/30 text-red-400' : 'bg-white/10 text-white'
+                  !isSpeakerOn ? 'bg-red-500 text-white' : 'bg-white/10 text-white hover:bg-white/20'
                 }`}
+                title={isSpeakerOn ? 'Speaker on' : 'Speaker off'}
               >
                 {isSpeakerOn ? (
                   <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -366,26 +510,6 @@ export default function CallBot() {
                 )}
               </button>
             </div>
-
-            {/* Text input for when mic isn't available */}
-            <div className="w-full max-w-sm">
-              <input
-                type="text"
-                placeholder="Or type here and press Enter..."
-                onKeyDown={handleTextInput}
-                className="w-full bg-white/10 text-white rounded-full px-4 py-2.5 text-sm placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            {/* End call button */}
-            <button
-              onClick={endCall}
-              className="w-16 h-16 bg-red-500 rounded-full flex items-center justify-center hover:bg-red-600 transition-all shadow-lg shadow-red-500/30 active:scale-95 mt-2"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="w-7 h-7 text-white rotate-[135deg]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z" />
-              </svg>
-            </button>
           </div>
         )}
       </div>
